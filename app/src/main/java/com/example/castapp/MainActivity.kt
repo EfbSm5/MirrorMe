@@ -6,18 +6,18 @@ import android.content.ServiceConnection
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.os.IBinder
+import android.view.Surface
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import com.example.castapp.ui.AppSurface
 import com.example.castapp.ui.theme.MyApplicationTheme
 
-private const val TAG = "MainActivity"
-
 class MainActivity : ComponentActivity() {
 
     private var receiverService: ReceiverService? = null
     private var isReceiverServiceBound = false
+    private var pendingSurface: Surface? = null
 
     private val mediaProjectionManager by lazy {
         getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -41,25 +41,59 @@ class MainActivity : ComponentActivity() {
             val binder = service as ReceiverService.LocalBinder
             receiverService = binder.getService()
             isReceiverServiceBound = true
+            pendingSurface?.let { surface ->
+                receiverService?.setSurface(surface)
+                pendingSurface = null
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             isReceiverServiceBound = false
+            receiverService = null
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val myIp = getIpAddress()
+        val gatewayIp = getGatewayIpAddress()
         setContent {
             MyApplicationTheme {
-                AppSurface()
+                AppSurface(
+                    myIp = myIp,
+                    gatewayIp = gatewayIp,
+                    onStartSend = {
+                        screenCaptureLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
+                    },
+                    onStartReceive = { surface ->
+                        // Start and bind receiver service, pass gateway IP so it can connect
+                        val startIntent = Intent(this, ReceiverService::class.java).apply {
+                            putExtra(ReceiverService.EXTRA_SENDER_IP, gatewayIp)
+                        }
+                        startForegroundService(startIntent)
+                        bindService(startIntent, serviceConnection, BIND_AUTO_CREATE)
+                        if (isReceiverServiceBound) {
+                            receiverService?.setSurface(surface)
+                        } else {
+                            pendingSurface = surface
+                        }
+                    },
+                    onStopReceive = {
+                        pendingSurface = null
+                        if (isReceiverServiceBound) {
+                            unbindService(serviceConnection)
+                            isReceiverServiceBound = false
+                        }
+                        stopService(Intent(this, ReceiverService::class.java))
+                    }
+                )
             }
         }
     }
 
-
     override fun onDestroy() {
         super.onDestroy()
+        pendingSurface = null
         if (isReceiverServiceBound) {
             unbindService(serviceConnection)
             isReceiverServiceBound = false

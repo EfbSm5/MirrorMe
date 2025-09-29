@@ -16,10 +16,12 @@ import android.media.projection.MediaProjectionManager
 import android.os.IBinder
 import android.util.DisplayMetrics
 import android.view.WindowManager
-import com.example.myapplication.R
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import java.io.DataOutputStream
 import java.io.IOException
-import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.Socket
 
@@ -30,7 +32,7 @@ class SenderService : Service() {
     private var mediaCodec: MediaCodec? = null
     private var serverSocket: ServerSocket? = null
     private var clientSocket: Socket? = null
-    private var clientStream: OutputStream? = null
+    private var dataOut: DataOutputStream? = null
     private val serviceJob = Job()
     private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
 
@@ -50,7 +52,8 @@ class SenderService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjectionManager =
+            getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         createNotificationChannel()
         val notification = Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("Screen Mirroring")
@@ -72,9 +75,8 @@ class SenderService : Service() {
                     }
                 }
             }
-            ACTION_STOP -> {
-                stopSelf()
-            }
+
+            ACTION_STOP -> stopSelf()
         }
         return START_NOT_STICKY
     }
@@ -83,11 +85,9 @@ class SenderService : Service() {
         try {
             serverSocket = ServerSocket(SERVER_PORT)
             clientSocket = serverSocket?.accept()
-            clientStream = clientSocket?.getOutputStream()
+            dataOut = DataOutputStream(clientSocket?.getOutputStream())
             mediaCodec?.start()
-            serviceScope.launch {
-                sendData()
-            }
+            serviceScope.launch { sendDataLoop() }
         } catch (e: IOException) {
             e.printStackTrace()
         }
@@ -97,13 +97,18 @@ class SenderService : Service() {
         mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data)
 
         val metrics = DisplayMetrics()
-        val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        @Suppress("DEPRECATION")
         windowManager.defaultDisplay.getMetrics(metrics)
 
-        val mediaFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_WIDTH, VIDEO_HEIGHT)
-        mediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, 1000000)
+        val mediaFormat =
+            MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_WIDTH, VIDEO_HEIGHT)
+        mediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, 1_500_000)
         mediaFormat.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-        mediaFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+        mediaFormat.setInteger(
+            MediaFormat.KEY_COLOR_FORMAT,
+            MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+        )
         mediaFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
 
         try {
@@ -121,29 +126,57 @@ class SenderService : Service() {
         }
     }
 
-    private fun sendData() {
+    private fun sendDataLoop() {
+        val codec = mediaCodec ?: return
         val bufferInfo = MediaCodec.BufferInfo()
-        while (isActive(serviceJob)) {
-            val outputBufferIndex = mediaCodec?.dequeueOutputBuffer(bufferInfo, 10000)
-            if (outputBufferIndex != null && outputBufferIndex >= 0) {
-                val outputBuffer = mediaCodec?.getOutputBuffer(outputBufferIndex)
-                if (outputBuffer != null) {
-                    val data = ByteArray(bufferInfo.size)
-                    outputBuffer.get(data)
-                    try {
-                        clientStream?.write(data)
-                    } catch (e: IOException) {
-                        e.printStackTrace()
-                        break
+        try {
+            while (serviceJob.isActive) {
+                when (val index = codec.dequeueOutputBuffer(bufferInfo, 10_000)) {
+                    MediaCodec.INFO_TRY_AGAIN_LATER -> {}
+                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        // Send CSD (SPS/PPS) so receiver can configure decoder
+                        val fmt = codec.outputFormat
+                        val csd0 = fmt.getByteBuffer("csd-0")
+                        val csd1 = fmt.getByteBuffer("csd-1")
+                        if (csd0 != null && csd0.remaining() > 0) {
+                            val sps = ByteArray(csd0.remaining())
+                            csd0.get(sps)
+                            dataOut?.writeInt(-1) // tag for csd-0
+                            dataOut?.writeInt(sps.size)
+                            dataOut?.write(sps)
+                            dataOut?.flush()
+                        }
+                        if (csd1 != null && csd1.remaining() > 0) {
+                            val pps = ByteArray(csd1.remaining())
+                            csd1.get(pps)
+                            dataOut?.writeInt(-2) // tag for csd-1
+                            dataOut?.writeInt(pps.size)
+                            dataOut?.write(pps)
+                            dataOut?.flush()
+                        }
+                    }
+
+                    else -> {
+                        if (index >= 0) {
+                            val outputBuffer = codec.getOutputBuffer(index)
+                            if (outputBuffer != null && bufferInfo.size > 0) {
+                                outputBuffer.position(bufferInfo.offset)
+                                outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                                val frame = ByteArray(bufferInfo.size)
+                                outputBuffer.get(frame)
+                                dataOut?.writeInt(frame.size)
+                                dataOut?.write(frame)
+                                dataOut?.flush()
+                            }
+                            codec.releaseOutputBuffer(index, false)
+                        }
                     }
                 }
-                mediaCodec?.releaseOutputBuffer(outputBufferIndex, false)
             }
+        } catch (e: IOException) {
+            // Socket disconnected or other IO issue: stop gracefully
+            e.printStackTrace()
         }
-    }
-
-    private fun isActive(job: Job): Boolean {
-        return job.isActive
     }
 
     override fun onDestroy() {
@@ -151,7 +184,7 @@ class SenderService : Service() {
         stopScreenCapture()
         serviceJob.cancel()
         try {
-            clientStream?.close()
+            dataOut?.close()
             clientSocket?.close()
             serverSocket?.close()
         } catch (e: IOException) {
@@ -166,9 +199,7 @@ class SenderService : Service() {
         mediaProjection?.stop()
     }
 
-    override fun onBind(intent: Intent?): IBinder? {
-        return null
-    }
+    override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
@@ -180,4 +211,3 @@ class SenderService : Service() {
         manager.createNotificationChannel(channel)
     }
 }
-
