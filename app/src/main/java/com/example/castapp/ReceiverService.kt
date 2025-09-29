@@ -1,4 +1,4 @@
-package com.example.myapplication
+package com.example.castapp
 
 import android.app.Notification
 import android.app.NotificationChannel

@@ -1,4 +1,4 @@
-package com.example.myapplication
+package com.example.castapp
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -16,6 +16,7 @@ import android.media.projection.MediaProjectionManager
 import android.os.IBinder
 import android.util.DisplayMetrics
 import android.view.WindowManager
+import com.example.myapplication.R
 import kotlinx.coroutines.*
 import java.io.IOException
 import java.io.OutputStream
@@ -36,8 +37,8 @@ class SenderService : Service() {
     private lateinit var mediaProjectionManager: MediaProjectionManager
 
     companion object {
-        const val ACTION_START = "com.example.myapplication.START_SENDER"
-        const val ACTION_STOP = "com.example.myapplication.STOP_SENDER"
+        const val ACTION_START = "com.example.castapp.START_SENDER"
+        const val ACTION_STOP = "com.example.castapp.STOP_SENDER"
         const val EXTRA_RESULT_CODE = "resultCode"
         const val EXTRA_RESULT_DATA = "resultData"
         private const val NOTIFICATION_CHANNEL_ID = "SenderServiceChannel"
