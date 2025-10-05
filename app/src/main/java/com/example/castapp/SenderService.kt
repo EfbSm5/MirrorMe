@@ -65,118 +65,91 @@ class SenderService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> {
-                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
-                val resultData = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
-                if (resultCode != -1 && resultData != null) {
-                    serviceScope.launch {
-                        startScreenCapture(resultCode, resultData)
-                        startServer()
-                    }
-                }
-            }
-
-            ACTION_STOP -> stopSelf()
+            ACTION_START -> startScreenSharing(intent)
+            ACTION_STOP -> stopScreenSharing()
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
-    private fun startServer() {
-        try {
-            serverSocket = ServerSocket(SERVER_PORT)
-            clientSocket = serverSocket?.accept()
-            dataOut = DataOutputStream(clientSocket?.getOutputStream())
-            mediaCodec?.start()
-            serviceScope.launch { sendDataLoop() }
-        } catch (e: IOException) {
-            e.printStackTrace()
-        }
+    private fun startScreenSharing(intent: Intent) {
+        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
+        val resultData = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+        mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, resultData!!)
+
+        setupVirtualDisplay()
+        setupMediaCodec()
+        startSocketServer()
     }
 
-    private fun startScreenCapture(resultCode: Int, data: Intent) {
-        mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data)
-
+    private fun setupVirtualDisplay() {
         val metrics = DisplayMetrics()
-        val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        @Suppress("DEPRECATION")
+        val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         windowManager.defaultDisplay.getMetrics(metrics)
 
-        val mediaFormat =
-            MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_WIDTH, VIDEO_HEIGHT)
-        mediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, 1_500_000)
-        mediaFormat.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-        mediaFormat.setInteger(
-            MediaFormat.KEY_COLOR_FORMAT,
-            MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+        val inputSurface = mediaCodec?.createInputSurface()
+        virtualDisplay = mediaProjection?.createVirtualDisplay(
+            "SenderDisplay",
+            VIDEO_WIDTH,
+            VIDEO_HEIGHT,
+            metrics.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
+            inputSurface,
+            null,
+            null
         )
-        mediaFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+    }
 
-        try {
-            mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            mediaCodec?.configure(mediaFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            val surface = mediaCodec?.createInputSurface()
-            virtualDisplay = mediaProjection?.createVirtualDisplay(
-                "ScreenCapture",
-                VIDEO_WIDTH, VIDEO_HEIGHT, metrics.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                surface, null, null
-            )
-        } catch (e: IOException) {
-            e.printStackTrace()
+    private fun setupMediaCodec() {
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_WIDTH, VIDEO_HEIGHT)
+        format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+        format.setInteger(MediaFormat.KEY_BIT_RATE, 6000000)
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+
+        mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        mediaCodec?.start()
+    }
+
+    private fun startSocketServer() {
+        serviceScope.launch {
+            try {
+                serverSocket = ServerSocket(SERVER_PORT)
+                clientSocket = serverSocket?.accept()
+                dataOut = DataOutputStream(clientSocket?.getOutputStream())
+
+                val bufferInfo = MediaCodec.BufferInfo()
+                while (true) {
+                    val outputBufferId = mediaCodec?.dequeueOutputBuffer(bufferInfo, 10000) ?: -1
+                    if (outputBufferId >= 0) {
+                        val encodedData = mediaCodec?.getOutputBuffer(outputBufferId)
+                        val chunk = ByteArray(bufferInfo.size)
+                        encodedData?.get(chunk)
+                        dataOut?.writeInt(bufferInfo.size)
+                        dataOut?.write(chunk)
+                        mediaCodec?.releaseOutputBuffer(outputBufferId, false)
+                    }
+                }
+            } catch (e: IOException) {
+                e.printStackTrace()
+            }
         }
     }
 
-    private fun sendDataLoop() {
-        val codec = mediaCodec ?: return
-        val bufferInfo = MediaCodec.BufferInfo()
-        try {
-            while (serviceJob.isActive) {
-                when (val index = codec.dequeueOutputBuffer(bufferInfo, 10_000)) {
-                    MediaCodec.INFO_TRY_AGAIN_LATER -> {}
-                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        // Send CSD (SPS/PPS) so receiver can configure decoder
-                        val fmt = codec.outputFormat
-                        val csd0 = fmt.getByteBuffer("csd-0")
-                        val csd1 = fmt.getByteBuffer("csd-1")
-                        if (csd0 != null && csd0.remaining() > 0) {
-                            val sps = ByteArray(csd0.remaining())
-                            csd0.get(sps)
-                            dataOut?.writeInt(-1) // tag for csd-0
-                            dataOut?.writeInt(sps.size)
-                            dataOut?.write(sps)
-                            dataOut?.flush()
-                        }
-                        if (csd1 != null && csd1.remaining() > 0) {
-                            val pps = ByteArray(csd1.remaining())
-                            csd1.get(pps)
-                            dataOut?.writeInt(-2) // tag for csd-1
-                            dataOut?.writeInt(pps.size)
-                            dataOut?.write(pps)
-                            dataOut?.flush()
-                        }
-                    }
-
-                    else -> {
-                        if (index >= 0) {
-                            val outputBuffer = codec.getOutputBuffer(index)
-                            if (outputBuffer != null && bufferInfo.size > 0) {
-                                outputBuffer.position(bufferInfo.offset)
-                                outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
-                                val frame = ByteArray(bufferInfo.size)
-                                outputBuffer.get(frame)
-                                dataOut?.writeInt(frame.size)
-                                dataOut?.write(frame)
-                                dataOut?.flush()
-                            }
-                            codec.releaseOutputBuffer(index, false)
-                        }
-                    }
-                }
+    private fun stopScreenSharing() {
+        serviceScope.launch {
+            try {
+                dataOut?.close()
+                clientSocket?.close()
+                serverSocket?.close()
+            } catch (e: IOException) {
+                e.printStackTrace()
             }
-        } catch (e: IOException) {
-            // Socket disconnected or other IO issue: stop gracefully
-            e.printStackTrace()
         }
+        mediaCodec?.stop()
+        mediaCodec?.release()
+        virtualDisplay?.release()
+        mediaProjection?.stop()
     }
 
     override fun onDestroy() {

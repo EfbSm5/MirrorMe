@@ -3,6 +3,8 @@ package com.example.castapp
 import android.app.Application
 import android.content.Context
 import android.widget.Toast
+import android.os.Handler
+import android.os.Looper
 
 class CastApp : Application() {
     override fun onCreate() {
@@ -18,7 +20,14 @@ class CastApp : Application() {
         }
 
         fun showMsg(text: String, duration: Int = Toast.LENGTH_SHORT) {
-            Toast.makeText(instance.applicationContext, text, duration).show()
+            val ctx = instance.applicationContext
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                Toast.makeText(ctx, text, duration).show()
+            } else {
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(ctx, text, duration).show()
+                }
+            }
         }
     }
 }

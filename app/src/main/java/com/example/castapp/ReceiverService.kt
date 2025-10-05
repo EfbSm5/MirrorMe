@@ -8,11 +8,8 @@ import android.content.Intent
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Binder
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
 import android.view.Surface
-import android.widget.Toast
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -51,129 +48,79 @@ class ReceiverService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        val notification = Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("Screen Mirroring")
-            .setContentText("Receiver service is running.")
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .build()
+        val notification =
+            Notification.Builder(this, NOTIFICATION_CHANNEL_ID).setContentTitle("Screen Mirroring")
+                .setContentText("Receiver service is running.").setSmallIcon(R.mipmap.ic_launcher)
+                .build()
         startForeground(NOTIFICATION_ID, notification)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val senderIp = intent?.getStringExtra(EXTRA_SENDER_IP)
         if (senderIp != null) {
-            serviceScope.launch { connectToSender(senderIp) }
+            startSocketClient(senderIp)
+        } else {
+            CastApp.showMsg("Sender IP not provided")
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
-    private fun connectToSender(senderIp: String) {
-        try {
-            clientSocket = Socket(senderIp, SERVER_PORT)
-            dataIn = DataInputStream(clientSocket!!.getInputStream())
-            startDecodingLoop()
-        } catch (e: IOException) {
-            e.printStackTrace()
-            Handler(Looper.getMainLooper()).post {
-                Toast.makeText(
-                    applicationContext,
-                    "Failed to connect to sender",
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-        }
-    }
-
-    fun setSurface(surface: Surface) {
-        this.surface = surface
-        initDecoderIfNeeded()
-    }
-
-    private fun initDecoderIfNeeded() {
-        if (decoderConfigured) return
-        val s = surface ?: return
-        val sps = csd0 ?: return
-        val pps = csd1 ?: return
-        try {
-            val format = MediaFormat.createVideoFormat(
-                MediaFormat.MIMETYPE_VIDEO_AVC,
-                VIDEO_WIDTH,
-                VIDEO_HEIGHT
-            )
-            format.setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(sps))
-            format.setByteBuffer("csd-1", java.nio.ByteBuffer.wrap(pps))
-            mediaCodec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            mediaCodec?.configure(format, s, null, 0)
-            mediaCodec?.start()
-            decoderConfigured = true
-        } catch (e: IOException) {
-            e.printStackTrace()
-        }
-    }
-
-    private fun startDecodingLoop() {
+    private fun startSocketClient(senderIp: String) {
         serviceScope.launch {
             try {
-                while (serviceJob.isActive) {
-                    val tag = try {
-                        dataIn?.readInt() ?: break
-                    } catch (e: IOException) {
-                        break
-                    }
-                    if (tag == -1 || tag == -2) {
-                        val len = dataIn?.readInt() ?: break
-                        if (len <= 0) continue
-                        val buf = ByteArray(len)
-                        var r = 0
-                        while (r < len) {
-                            val n = dataIn?.read(buf, r, len - r) ?: -1
-                            if (n <= 0) throw IOException("Stream closed")
-                            r += n
-                        }
-                        if (!decoderConfigured) {
-                            if (tag == -1) csd0 = buf else if (tag == -2) csd1 = buf
-                            initDecoderIfNeeded()
-                        }
-                        continue
-                    }
-                    val len = tag
-                    if (len <= 0) continue
-                    val frame = ByteArray(len)
-                    var read = 0
-                    while (read < len) {
-                        val n = dataIn?.read(frame, read, len - read) ?: -1
-                        if (n <= 0) throw IOException("Stream closed")
-                        read += n
-                    }
-                    val codec = mediaCodec
-                    if (codec != null && decoderConfigured) {
-                        val inIndex = codec.dequeueInputBuffer(10_000)
-                        if (inIndex >= 0) {
-                            val inBuf = codec.getInputBuffer(inIndex)
-                            inBuf?.clear()
-                            if (inBuf != null && inBuf.capacity() >= len) {
-                                inBuf.put(frame)
-                                codec.queueInputBuffer(inIndex, 0, len, System.nanoTime() / 1000, 0)
-                            } else {
-                                codec.queueInputBuffer(inIndex, 0, 0, 0, 0)
-                            }
-                        }
-                        val bufferInfo = MediaCodec.BufferInfo()
-                        var outIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
-                        while (outIndex >= 0) {
-                            codec.releaseOutputBuffer(outIndex, true)
-                            outIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
-                        }
-                    }
-                }
-            } catch (e: Exception) {
+                clientSocket = Socket(senderIp, SERVER_PORT)
+                dataIn = DataInputStream(clientSocket?.getInputStream())
+
+                setupMediaCodec()
+                receiveAndDecodeFrames()
+            } catch (e: IOException) {
                 e.printStackTrace()
-            } finally {
-                Handler(Looper.getMainLooper()).post {
-                    Toast.makeText(applicationContext, "Receiver disconnected", Toast.LENGTH_SHORT)
-                        .show()
+                CastApp.showMsg("Failed to connect to sender")
+            }
+        }
+    }
+
+    private fun setupMediaCodec() {
+        val format =
+            MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_WIDTH, VIDEO_HEIGHT)
+        format.setByteBuffer("csd-0", csd0?.let { java.nio.ByteBuffer.wrap(it) })
+        format.setByteBuffer("csd-1", csd1?.let { java.nio.ByteBuffer.wrap(it) })
+
+        mediaCodec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        mediaCodec?.configure(format, surface, null, 0)
+        mediaCodec?.start()
+        decoderConfigured = true
+    }
+
+    private fun receiveAndDecodeFrames() {
+        val bufferInfo = MediaCodec.BufferInfo()
+        try {
+            while (true) {
+                val frameSize = dataIn?.readInt() ?: break
+                val frameData = ByteArray(frameSize)
+                dataIn?.readFully(frameData)
+
+                val inputBufferId = mediaCodec?.dequeueInputBuffer(10000) ?: -1
+                if (inputBufferId >= 0) {
+                    val inputBuffer = mediaCodec?.getInputBuffer(inputBufferId)
+                    inputBuffer?.clear()
+                    inputBuffer?.put(frameData)
+                    mediaCodec?.queueInputBuffer(
+                        inputBufferId,
+                        0,
+                        frameSize,
+                        System.nanoTime() / 1000,
+                        0
+                    )
+                }
+
+                val outputBufferId = mediaCodec?.dequeueOutputBuffer(bufferInfo, 10000) ?: -1
+                if (outputBufferId >= 0) {
+                    mediaCodec?.releaseOutputBuffer(outputBufferId, true)
                 }
             }
+        } catch (e: IOException) {
+            e.printStackTrace()
         }
     }
 
@@ -186,16 +133,8 @@ class ReceiverService : Service() {
         } catch (e: IOException) {
             e.printStackTrace()
         }
-        try {
-            mediaCodec?.stop()
-            mediaCodec?.release()
-        } catch (_: Exception) {
-        }
-        mediaCodec = null
-        surface = null
-        csd0 = null
-        csd1 = null
-        decoderConfigured = false
+        mediaCodec?.stop()
+        mediaCodec?.release()
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -208,5 +147,12 @@ class ReceiverService : Service() {
         )
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(channel)
+    }
+
+    fun setSurface(surface: Surface) {
+        this.surface = surface
+        if (decoderConfigured) {
+            mediaCodec?.setOutputSurface(surface)
+        }
     }
 }
